@@ -56,7 +56,6 @@ class InfinityComms(threading.Thread):
         message_id, message = self.construct_message(command, data)
         result = Deferred()
         self.pending_requests[message_id] = result
-        print(message)
         self.device.write(message)
         return Promise(result)
 
