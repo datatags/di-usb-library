@@ -1,26 +1,25 @@
 import threading
 from collections import defaultdict
-import hidapi
+import hid
 
 class InfinityComms(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
         self.device = self.initBase()
-	self.finish = False
+        self.finish = False
         self.pending_requests = {}
         self.message_number = 0
         self.observers = []
 
     def initBase(self):
-        hidapi.hid_init()
-        device = hidapi.hid_open(0x0e6f, 0x0129)
-	hidapi.hid_set_nonblocking(device, False)
+        device = hid.device()
+        device.open(0x0e6f, 0x0129)
+        device.set_nonblocking(False)
         return device
 
     def run(self):
         while not self.finish:
-            line = hidapi.hid_read_timeout(self.device,32,3000)
-
+            line = self.device.read(max_length=32, timeout_ms=3000)
             if not len(line):
                 continue
 
@@ -57,7 +56,8 @@ class InfinityComms(threading.Thread):
         message_id, message = self.construct_message(command, data)
         result = Deferred()
         self.pending_requests[message_id] = result
-        hidapi.hid_write(self.device, message)
+        print(message)
+        self.device.write(message)
         return Promise(result)
 
     def construct_message(self, command, data):
@@ -71,12 +71,12 @@ class InfinityComms(threading.Thread):
             message[index] = byte
             checksum = checksum + byte
         message[len(command_bytes)] = checksum & 0xff
-        return (message_id, map(chr, message))
+        return (message_id, message)
 
 
 class Deferred(object):
     def __init__(self):
-	self.event = threading.Event()
+        self.event = threading.Event()
         self.rejected = False
         self.result = None
 
