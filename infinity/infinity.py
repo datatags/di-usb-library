@@ -195,7 +195,6 @@ if __name__ == '__main__':
 
     base.flashColor(3, 0, 0, 200)
 
-    print("Try adding and removing figures and discs to/from the base. CTRL-C to quit")
-    while True:
-        pass
+    print("Try adding and removing figures and discs to/from the base. Enter to quit")
+    input()
 
