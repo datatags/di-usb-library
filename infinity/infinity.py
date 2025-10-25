@@ -12,14 +12,13 @@ class InfinityComms(threading.Thread):
         self.observers = []
 
     def initBase(self):
-        device = hid.device()
-        device.open(0x0e6f, 0x0129)
-        device.set_nonblocking(False)
+        device = hid.Device(0x0e6f, 0x0129)
+        device.nonblocking = False
         return device
 
     def run(self):
         while not self.finish:
-            line = self.device.read(max_length=32, timeout_ms=3000)
+            line = self.device.read(32, timeout=3000)
             if not len(line):
                 continue
 
@@ -56,7 +55,7 @@ class InfinityComms(threading.Thread):
         message_id, message = self.construct_message(command, data)
         result = Deferred()
         self.pending_requests[message_id] = result
-        self.device.write(message)
+        self.device.write(bytes(message))
         return Promise(result)
 
     def construct_message(self, command, data):
