@@ -10,6 +10,7 @@ class InfinityComms(threading.Thread):
         self.pending_requests = {}
         self.message_number = 0
         self.observers = []
+        self.lock = threading.Lock()
 
     def initBase(self):
         device = hid.Device(0x0e6f, 0x0129)
@@ -55,7 +56,8 @@ class InfinityComms(threading.Thread):
         message_id, message = self.construct_message(command, data)
         result = Deferred()
         self.pending_requests[message_id] = result
-        self.device.write(bytes(message))
+        with self.lock:
+            self.device.write(bytes(message))
         return Promise(result)
 
     def construct_message(self, command, data):
