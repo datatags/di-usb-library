@@ -51,26 +51,31 @@ class InfinityComms:
         self.message_number = (self.message_number + 1) % 256
         return self.message_number
 
-    async def send_message(self, command, data = []):
-        message_id, message = self._construct_message(command, data)
+    async def send_message(self, command: int, data: list[int] = []):
+        message_id, message = self._construct_message(command, bytes(data))
         result = asyncio.get_event_loop().create_future()
         self.pending_requests[message_id] = result
         async with self.lock:
-            self.device.write(bytes(message))
+            self.device.write(message)
         return await result
 
-    def _construct_message(self, command, data):
+    def _construct_message(self, command: int, data: bytes):
         message_id = self._next_message_number()
-        command_body = [command, message_id] + data
-        command_length = len(command_body)
-        command_bytes = [0x00, 0xff, command_length] + command_body
-        message = [0x00] * 33
+        command_bytes = b"\x00\xff"
+        def to_bytes(val: int):
+            return val.to_bytes(1, byteorder="big")
+        command_bytes += to_bytes(2 + len(data))
+        command_bytes += to_bytes(command)
+        command_bytes += to_bytes(message_id)
+        command_bytes += data
+
         checksum = 0
-        for (index, byte) in enumerate(command_bytes):
-            message[index] = byte
-            checksum = checksum + byte
-        message[len(command_bytes)] = checksum & 0xff
-        return (message_id, message)
+        for byte in command_bytes:
+            checksum += byte
+        command_bytes += to_bytes(checksum & 0xFF)
+        # Pad out to 33 bytes
+        command_bytes += b"\0" * (33 - len(command_bytes))
+        return (message_id, command_bytes)
 
 
 class InfinityBase(object):
