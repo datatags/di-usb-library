@@ -30,14 +30,14 @@ class TagChangeEvent:
 
 class InfinityComms:
     def __init__(self):
-        self.device = self._initBase()
+        self.device = self._init_base()
         self.finish = False
         self.pending_requests = {}
         self.message_number = 0
         self.observers = []
         self.lock = asyncio.Lock()
 
-    def _initBase(self):
+    def _init_base(self):
         device = hid.Device(DEVICE_VID, DEVICE_PID)
         device.nonblocking = False
         return device
@@ -57,16 +57,16 @@ class InfinityComms:
                     continue
             elif fields[0] == 0xab:
                 # Do on a separate task in case observers send commands
-                asyncio.create_task(self._notifyObservers(TagChangeEvent(fields)))
+                asyncio.create_task(self._notify_observers(TagChangeEvent(fields)))
                 continue
             self._unknown_message(fields)
 
-    def addObserver(self, object):
+    def add_observer(self, object):
         self.observers.append(object)
 
-    async def _notifyObservers(self, event: TagChangeEvent):
+    async def _notify_observers(self, event: TagChangeEvent):
         for obs in self.observers:
-            await obs.tagsUpdated(event)
+            await obs.tags_updated(event)
 
     def _unknown_message(self, fields):
         print("UNKNOWN MESSAGE RECEIVED ", fields)
@@ -105,8 +105,8 @@ class InfinityComms:
 class InfinityBase(object):
     def __init__(self):
         self.comms = InfinityComms()
-        self.comms.addObserver(self)
-        self.onTagsChanged = None
+        self.comms.add_observer(self)
+        self.on_tags_changed = None
 
     async def connect(self):
         self.comms_task = asyncio.get_event_loop().create_task(self.comms.run())
@@ -122,45 +122,45 @@ class InfinityBase(object):
                             0x20,0x32,0x30,0x31,0x33]
         await self.comms.send_message(0x80, activate_message)
 
-    async def tagsUpdated(self, event: TagChangeEvent):
-        if self.onTagsChanged:
-            await self.onTagsChanged(event)
+    async def tags_updated(self, event: TagChangeEvent):
+        if self.on_tags_changed:
+            await self.on_tags_changed(event)
 
-    async def getAllTags(self) -> dict[int, list[Tag]]:
-        tags = await self.getTagIndex()
+    async def get_all_tags(self) -> dict[int, list[Tag]]:
+        tags = await self.get_tag_index()
         if len(tags) == 0:
             return {}
         tagByPlatform = defaultdict(list)
         for tag in tags:
-            await self.loadTagUid(tag)
+            await self.load_tag_uid(tag)
             tagByPlatform[tag.platform].append(tag)
         return dict(tagByPlatform)
 
-    async def getTagIndex(self) -> list[Tag]:
+    async def get_tag_index(self) -> list[Tag]:
         data = await self.comms.send_message(0xa1)
         tags = []
         for i in range(0, len(data), 2):
             tags.append(Tag(data[i:i+2]))
         return tags
 
-    async def loadTagUid(self, tag: Tag):
+    async def load_tag_uid(self, tag: Tag):
         # First byte is a status or something, 0x00 if the tag exists, 0x80 if it doesn't
         tag.uid = (await self.comms.send_message(0xb4, [tag.index]))[1:]
 
-    async def setColor(self, platform: int, r: int, g: int, b: int):
+    async def set_color(self, platform: int, r: int, g: int, b: int):
         await self.comms.send_message(0x90, [platform, r, g, b])
 
-    async def fadeColor(self, platform: int, r: int, g: int, b: int):
+    async def fade_color(self, platform: int, r: int, g: int, b: int):
         await self.comms.send_message(0x92, [platform, 0x10, 0x02, r, g, b])
 
-    async def flashColor(self, platform: int, r: int, g: int, b: int):
+    async def flash_color(self, platform: int, r: int, g: int, b: int):
         await self.comms.send_message(0x93, [platform, 0x02, 0x02, 0x06, r, g, b])
 
 async def main():
     base = InfinityBase()
 
-    async def onChange(event: TagChangeEvent):
-        tags = await base.getAllTags()
+    async def on_change(event: TagChangeEvent):
+        tags = await base.get_all_tags()
         color = (0, 0, 0)
         count = len(tags.get(event.platform, []))
         if count == 1:
@@ -169,23 +169,23 @@ async def main():
             color = (0, 56, 0)
         elif count > 2:
             color = (200, 0, 0)
-        await base.setColor(event.platform, *color)
+        await base.set_color(event.platform, *color)
 
-    base.onTagsChanged = onChange
+    base.on_tags_changed = on_change
 
     await base.connect()
 
-    print(f"Tags: {await base.getAllTags()}")
+    print(f"Tags: {await base.get_all_tags()}")
 
-    await base.setColor(1, 200, 0, 0)
+    await base.set_color(1, 200, 0, 0)
 
-    await base.setColor(2, 0, 56, 0)
+    await base.set_color(2, 0, 56, 0)
 
-    await base.fadeColor(3, 0, 0, 200)
+    await base.fade_color(3, 0, 0, 200)
 
     await asyncio.sleep(3)
 
-    await base.flashColor(3, 0, 0, 200)
+    await base.flash_color(3, 0, 0, 200)
 
     print("Try adding and removing figures and discs to/from the base. Ctrl-C to quit")
     await base.comms_task
