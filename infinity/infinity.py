@@ -5,6 +5,29 @@ import hid
 DEVICE_VID = 0x0e6f
 DEVICE_PID = 0x0129
 
+class Tag:
+    def __init__(self, index: bytes):
+        self.platform = index[0] >> 4
+        self.index    = index[0] & 0x0F
+        # ISO 14443A SAK, always 0x09 for DI tags
+        self.sak      = index[1]
+        self.uid      = None
+
+    def __str__(self):
+        return f"Tag(platform={self.platform},index={self.index},sak={self.sak},uid={self.uid})"
+
+    def __repr__(self):
+        return str(self)
+
+
+class TagChangeEvent:
+    def __init__(self, data: bytes):
+        self.platform = data[2]
+        self.tag_type = data[3]
+        self.tag_index = data[4]
+        self.is_removed = bool(data[5])
+
+
 class InfinityComms:
     def __init__(self):
         self.device = self._initBase()
@@ -33,16 +56,17 @@ class InfinityComms:
                     del self.pending_requests[message_id]
                     continue
             elif fields[0] == 0xab:
-                self._notifyObservers()
+                # Do on a separate task in case observers send commands
+                asyncio.create_task(self._notifyObservers(TagChangeEvent(fields)))
                 continue
             self._unknown_message(fields)
 
     def addObserver(self, object):
         self.observers.append(object)
 
-    def _notifyObservers(self):
+    async def _notifyObservers(self, event: TagChangeEvent):
         for obs in self.observers:
-            obs.tagsUpdated()
+            await obs.tagsUpdated(event)
 
     def _unknown_message(self, fields):
         print("UNKNOWN MESSAGE RECEIVED ", fields)
@@ -73,8 +97,8 @@ class InfinityComms:
         for byte in command_bytes:
             checksum += byte
         command_bytes += to_bytes(checksum & 0xFF)
-        # Pad out to 33 bytes
-        command_bytes += b"\0" * (33 - len(command_bytes))
+        # Previous implementation padded out the message to 33 bytes with zeroes,
+        # but this doesn't seem to be necessary
         return (message_id, command_bytes)
 
 
@@ -98,26 +122,30 @@ class InfinityBase(object):
                             0x20,0x32,0x30,0x31,0x33]
         await self.comms.send_message(0x80, activate_message)
 
-    def tagsUpdated(self):
+    async def tagsUpdated(self, event: TagChangeEvent):
         if self.onTagsChanged:
-            self.onTagsChanged()
+            await self.onTagsChanged(event)
 
-    async def getAllTags(self) -> dict[int, list[list[int]]]:
-        idx = await self.getTagIdx()
-        if len(idx) == 0:
+    async def getAllTags(self) -> dict[int, list[Tag]]:
+        tags = await self.getTagIndex()
+        if len(tags) == 0:
             return {}
         tagByPlatform = defaultdict(list)
-        for (platform, tagIdx) in idx:
-            tag = await self.getTag(tagIdx)
-            tagByPlatform[platform].append(tag)
+        for tag in tags:
+            await self.loadTagUid(tag)
+            tagByPlatform[tag.platform].append(tag)
         return dict(tagByPlatform)
 
-    async def getTagIdx(self) -> list[tuple[int, int]]:
+    async def getTagIndex(self) -> list[Tag]:
         data = await self.comms.send_message(0xa1)
-        return [ ((byte & 0xF0) >> 4, byte & 0x0F) for byte in data if byte != 0x09]
+        tags = []
+        for i in range(0, len(data), 2):
+            tags.append(Tag(data[i:i+2]))
+        return tags
 
-    async def getTag(self, idx) -> list[int]:
-        return await self.comms.send_message(0xb4, [idx])
+    async def loadTagUid(self, tag: Tag):
+        # First byte is a status or something, 0x00 if the tag exists, 0x80 if it doesn't
+        tag.uid = (await self.comms.send_message(0xb4, [tag.index]))[1:]
 
     async def setColor(self, platform: int, r: int, g: int, b: int):
         await self.comms.send_message(0x90, [platform, r, g, b])
@@ -129,12 +157,21 @@ class InfinityBase(object):
         await self.comms.send_message(0x93, [platform, 0x02, 0x02, 0x06, r, g, b])
 
 async def main():
-    def futurePrint(s):
-        print(s)
-
     base = InfinityBase()
 
-    base.onTagsChanged = lambda: futurePrint("Tags added or removed.")
+    async def onChange(event: TagChangeEvent):
+        tags = await base.getAllTags()
+        color = (0, 0, 0)
+        count = len(tags.get(event.platform, []))
+        if count == 1:
+            color = (0, 0, 200)
+        elif count == 2:
+            color = (0, 56, 0)
+        elif count > 2:
+            color = (200, 0, 0)
+        await base.setColor(event.platform, *color)
+
+    base.onTagsChanged = onChange
 
     await base.connect()
 
