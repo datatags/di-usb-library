@@ -1,67 +1,66 @@
-import threading
 from collections import defaultdict
+import asyncio
 import hid
 
-class InfinityComms(threading.Thread):
+DEVICE_VID = 0x0e6f
+DEVICE_PID = 0x0129
+
+class InfinityComms:
     def __init__(self):
-        threading.Thread.__init__(self)
-        self.device = self.initBase()
+        self.device = self._initBase()
         self.finish = False
         self.pending_requests = {}
         self.message_number = 0
         self.observers = []
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
 
-    def initBase(self):
-        device = hid.Device(0x0e6f, 0x0129)
+    def _initBase(self):
+        device = hid.Device(DEVICE_VID, DEVICE_PID)
         device.nonblocking = False
         return device
 
-    def run(self):
+    async def run(self):
         while not self.finish:
-            line = self.device.read(32, timeout=3000)
-            if not len(line):
+            fields = await asyncio.get_event_loop().run_in_executor(None, self.device.read, 32, 1000)
+            if len(fields) == 0:
                 continue
 
-            fields = [c for c in line]
             if fields[0] == 0xaa:
                 length = fields[1]
                 message_id = fields[2]
                 if message_id in self.pending_requests:
-                    deferred = self.pending_requests[message_id]
-                    deferred.resolve(fields[3:length+2])
+                    self.pending_requests[message_id].set_result(fields[3:length+2])
                     del self.pending_requests[message_id]
-                else:
-                    self.unknown_message(line)
+                    continue
             elif fields[0] == 0xab:
-                self.notifyObservers()
-            else:
-                self.unknown_message(line)
+                self._notifyObservers()
+                continue
+            self._unknown_message(fields)
 
     def addObserver(self, object):
         self.observers.append(object)
 
-    def notifyObservers(self):
+    def _notifyObservers(self):
         for obs in self.observers:
             obs.tagsUpdated()
 
-    def unknown_message(self, fields):
+    def _unknown_message(self, fields):
         print("UNKNOWN MESSAGE RECEIVED ", fields)
 
-    def next_message_number(self):
+    def _next_message_number(self):
         self.message_number = (self.message_number + 1) % 256
         return self.message_number
 
-    def send_message(self, command, data = []):
-        message_id, message = self.construct_message(command, data)
-        result = Deferred()
+    async def send_message(self, command, data = []):
+        message_id, message = self._construct_message(command, data)
+        result = asyncio.get_event_loop().create_future()
         self.pending_requests[message_id] = result
-        with self.lock:
+        async with self.lock:
             self.device.write(bytes(message))
-        return Promise(result)
+        return await result
 
-    def construct_message(self, command, data):
-        message_id = self.next_message_number()
+    def _construct_message(self, command, data):
+        message_id = self._next_message_number()
         command_body = [command, message_id] + data
         command_length = len(command_body)
         command_bytes = [0x00, 0xff, command_length] + command_body
@@ -74,106 +73,57 @@ class InfinityComms(threading.Thread):
         return (message_id, message)
 
 
-class Deferred(object):
-    def __init__(self):
-        self.event = threading.Event()
-        self.rejected = False
-        self.result = None
-
-    def resolve(self, value):
-        self.rejected = False
-        self.result = value
-        self.event.set()
-
-    def wait(self):
-        while not self.event.is_set():
-            self.event.wait(3)
-
-
-class Promise(object):
-    def __init__(self, deferred):
-        self.deferred = deferred
-
-    def then(self, success, failure=None):
-        def task():
-            try:
-                self.deferred.wait()
-                result = self.deferred.result
-                success(result)
-            except Exception as ex:
-                if failure:
-                    failure(ex)
-                else:
-                    print(ex.message)
-        threading.Thread(target=task).start()
-        return self
-
-    def wait(self):
-        self.deferred.wait()
-
-
 class InfinityBase(object):
     def __init__(self):
         self.comms = InfinityComms()
         self.comms.addObserver(self)
         self.onTagsChanged = None
 
-    def connect(self):
-        self.comms.daemon = True
-        self.comms.start()
-        self.activate()
+    async def connect(self):
+        self.comms_task = asyncio.get_event_loop().create_task(self.comms.run())
+        await self.activate()
 
     def disconnect(self):
         self.comms.finish = True
+        self.comms_task.cancel()
 
-    def activate(self):
+    async def activate(self):
         activate_message = [0x28,0x63,0x29,0x20,0x44,
                             0x69,0x73,0x6e,0x65,0x79,
                             0x20,0x32,0x30,0x31,0x33]
-        self.comms.send_message(0x80, activate_message)
+        await self.comms.send_message(0x80, activate_message)
 
     def tagsUpdated(self):
         if self.onTagsChanged:
             self.onTagsChanged()
 
-    def getAllTags(self, then):
-        def queryAllTags(idx):
-            if len(idx) == 0:
-                then(dict())
-            numberToGet = [0] * len(idx)
-            tagByPlatform = defaultdict(list)
-            for (platform, tagIdx) in idx:
-                def fileTag(platform):
-                    def inner(tag):
-                        tagByPlatform[platform].append(tag)
-                        numberToGet.pop()
-                        if len(numberToGet) == 0:
-                            then(dict(tagByPlatform))
-                    return inner
-                self.getTag(tagIdx, fileTag(platform))
-        self.getTagIdx(queryAllTags)
+    async def getAllTags(self) -> dict[int, list[list[int]]]:
+        idx = await self.getTagIdx()
+        if len(idx) == 0:
+            return {}
+        tagByPlatform = defaultdict(list)
+        for (platform, tagIdx) in idx:
+            tag = await self.getTag(tagIdx)
+            tagByPlatform[platform].append(tag)
+        return dict(tagByPlatform)
 
-    def getTagIdx(self, then):
-        def parseIndex(bytes):
-            values = [ ((byte & 0xF0) >> 4, byte & 0x0F ) for byte in bytes if byte != 0x09]
-            then(values)
-        self.comms.send_message(0xa1).then(parseIndex)
+    async def getTagIdx(self) -> list[tuple[int, int]]:
+        data = await self.comms.send_message(0xa1)
+        return [ ((byte & 0xF0) >> 4, byte & 0x0F) for byte in data if byte != 0x09]
 
-    def getTag(self, idx, then):
-        self.comms.send_message(0xb4, [idx]).then(then)
+    async def getTag(self, idx) -> list[int]:
+        return await self.comms.send_message(0xb4, [idx])
 
-    def setColor(self, platform, r, g, b):
-        self.comms.send_message(0x90, [platform, r, g, b])
+    async def setColor(self, platform: int, r: int, g: int, b: int):
+        await self.comms.send_message(0x90, [platform, r, g, b])
 
-    def fadeColor(self, platform, r, g, b):
-        self.comms.send_message(0x92, [platform, 0x10, 0x02, r, g, b])
+    async def fadeColor(self, platform: int, r: int, g: int, b: int):
+        await self.comms.send_message(0x92, [platform, 0x10, 0x02, r, g, b])
 
-    def flashColor(self, platform, r, g, b):
-        self.comms.send_message(0x93, [platform, 0x02, 0x02, 0x06, r, g, b])
+    async def flashColor(self, platform: int, r: int, g: int, b: int):
+        await self.comms.send_message(0x93, [platform, 0x02, 0x02, 0x06, r, g, b])
 
-if __name__ == '__main__':
-    import time
-
+async def main():
     def futurePrint(s):
         print(s)
 
@@ -181,20 +131,25 @@ if __name__ == '__main__':
 
     base.onTagsChanged = lambda: futurePrint("Tags added or removed.")
 
-    base.connect()
+    await base.connect()
 
-    base.getAllTags(futurePrint)
+    print(f"Tags: {await base.getAllTags()}")
 
-    base.setColor(1, 200, 0, 0)
+    await base.setColor(1, 200, 0, 0)
 
-    base.setColor(2, 0, 56, 0)
+    await base.setColor(2, 0, 56, 0)
 
-    base.fadeColor(3, 0, 0, 200)
+    await base.fadeColor(3, 0, 0, 200)
 
-    time.sleep(3)
+    await asyncio.sleep(3)
 
-    base.flashColor(3, 0, 0, 200)
+    await base.flashColor(3, 0, 0, 200)
 
-    print("Try adding and removing figures and discs to/from the base. Enter to quit")
-    input()
+    print("Try adding and removing figures and discs to/from the base. Ctrl-C to quit")
+    await base.comms_task
 
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
