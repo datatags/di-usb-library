@@ -1,3 +1,4 @@
+from dataclasses import dataclass, astuple
 from collections import defaultdict
 from enum import Enum
 import asyncio
@@ -7,13 +8,49 @@ DEVICE_VID = 0x0e6f
 DEVICE_PID = 0x0129
 
 
+@dataclass
+class Color:
+    """Simple class to avoid having to pass around r/g/b separately
+
+    Each value should 0-255, inclusive.
+    """
+    r: int
+    g: int
+    b: int
+
+    def __iter__(self):
+        # https://stackoverflow.com/a/59569566 for easier unpacking
+        return iter(astuple(self))
+
+
+class Platform(Enum):
+    ALL_PLATFORMS = 0
+    HEXAGONAL = 1
+    PLAYER_ONE = 2
+    PLAYER_TWO = 3
+
+    def __int__(self):
+        return self.value
+
+
 class ErrorType(Enum):
-    NO_SUCH_TAG = 0x80
-    TAG_IO_ERROR = 0x82
+    SUCCESS = (0x00, "Success")
+    NO_SUCH_TAG = (0x80, "No such tag") # Occurs when requesting info on a tag index that isn't there
+    TAG_IO_ERROR = (0x82, "Tag I/O error") # General failure, e.g. auth failure or tag removed during communication
+    TAG_AUTH_UNSUPPORTED = (0x83, "Tag auth unsupported") # Tag requires an unsupported authentication method
+
+    def __new__(cls, val: int, msg: str):
+        entry = object.__new__(cls)
+        entry._value_ = val
+        entry.msg = msg
+        return entry
+
+    def __str__(self):
+        return self.msg
 
 
 class Tag:
-    def __init__(self, platform: int, index: int, sak: int):
+    def __init__(self, platform: int | Platform, index: int, sak: int):
         self.platform = platform
         self.index    = index
         # ISO 14443A SAK, always 0x09 for DI tags (Mifare Classic Mini)
@@ -25,7 +62,7 @@ class Tag:
         return Tag(index[0] >> 4, index[0] & 0x0F, index[1])
 
     def __str__(self):
-        return f"Tag(platform={self.platform},index={self.index},sak={self.sak},uid={self.uid})"
+        return f"Tag(platform={int(self.platform)},index={self.index},sak={self.sak},uid={self.uid})"
 
     def __repr__(self):
         return str(self)
@@ -38,16 +75,17 @@ class TagChangeEvent:
 
 
 class InfinityComms:
-    def __init__(self):
-        self.device = self._init_base()
+    def __init__(self, serial: str | None = None):
+        self.device = self._init_base(serial)
         self.finish = False
         self.pending_requests = {}
         self.message_number = 0
         self.observers = []
         self.lock = asyncio.Lock()
 
-    def _init_base(self):
-        device = hid.Device(DEVICE_VID, DEVICE_PID)
+    def _init_base(self, serial: str | None):
+        device = hid.Device(DEVICE_VID, DEVICE_PID, serial)
+        print(f"Connected to {device.serial}")
         device.nonblocking = False
         return device
 
@@ -112,8 +150,13 @@ class InfinityComms:
 
 
 class InfinityBase(object):
-    def __init__(self):
-        self.comms = InfinityComms()
+    """
+    Another Disney Infinity base implementation was referenced for some of the advanced
+    lighting control features here, see:
+    https://github.com/johndrinkwater/Disney-Infinity-and-Skylanders-Lighting
+    """
+    def __init__(self, serial: str | None = None):
+        self.comms = InfinityComms(serial)
         self.comms.add_observer(self)
         self.on_tags_changed = None
 
@@ -162,14 +205,57 @@ class InfinityBase(object):
             raise ValueError("No such tag")
         tag.uid = data[1:]
 
-    async def set_color(self, platform: int, r: int, g: int, b: int):
-        await self.comms.send_message(0x90, [platform, r, g, b])
+    async def set_color(self, platform: int | Platform, color: Color):
+        """Set the color of a platform
 
-    async def fade_color(self, platform: int, r: int, g: int, b: int):
-        await self.comms.send_message(0x92, [platform, 0x10, 0x02, r, g, b])
+        Arguments:
+        platform -- the platform to control
+        color -- the color to set the platform to
+        """
+        await self.comms.send_message(0x90, [int(platform), *color])
 
-    async def flash_color(self, platform: int, r: int, g: int, b: int):
-        await self.comms.send_message(0x93, [platform, 0x02, 0x02, 0x06, r, g, b])
+    async def fade_color(self, platform: int | Platform, color: Color, duration: int = 0x10, count: int = 2):
+        """Fade a platform color in and out according to the parameters.
+
+        Arguments:
+        platform -- the platform to control
+        color -- the color to make the platform
+        duration -- the duration of the cycle in 1/16-second increments. 16 = 0x10 = 1 second
+        count -- the number of half-cycles to perform, e.g. 1 is off-to-on, 2 is off-on-off, etc
+        """
+        await self.comms.send_message(0x92, [int(platform), duration, count, *color])
+
+    async def flash_color(self, platform: int | Platform, color: Color, onTime: int = 0x02, offTime: int = 0x02, count: int = 0x06):
+        """Flash a platform on and off
+
+        Arguments:
+        platform -- the platform to control
+        color -- the color to make the platform
+        onTime -- the duration of each on-cycle in 1/16-second increments. 16 = 0x10 = 1 second
+        offTime -- the duration of each off-cycle in 1/16 second increments. 16 = 0x10 = 1 second
+        count -- the number of half-cycles to perform, e.g. 1 is off-to-on, 2 is off-on-off, etc
+        """
+        await self.comms.send_message(0x93, [int(platform), onTime, offTime, count, *color])
+
+    async def fade_random(self, platform: int | Platform, duration: int = 0x10, count: int = 0x02):
+        """Fade a platform between its current color and random other colors
+
+        Arguments:
+        platform -- the platform to control
+        onTime -- the duration of each on-cycle in 1/16-second increments. 16 = 0x10 = 1 second
+        count -- the number of half-cycles to perform, e.g. 1 is src-to-dest, 2 is src-dest-src, etc
+        """
+        await self.comms.send_message(0x94, [int(platform), duration, count])
+
+
+    def _check_for_error(self, code: int):
+        if code == ErrorType.SUCCESS.value:
+            return # yay!
+        try:
+            error = ErrorType(code)
+        except ValueError:
+            raise ValueError(f"Unknown error: {hex(code)}")
+        raise ValueError(error.msg)
 
     async def read_tag(self, tag: Tag, sector: int, offset: int = 0) -> bytes:
         """Read a data block from the tag.
@@ -184,8 +270,7 @@ class InfinityBase(object):
         offset -- the offset within the sector to read
         """
         data = await self.comms.send_message(0xa2, [tag.index, sector, offset])
-        if data[0] == ErrorType.TAG_IO_ERROR.value:
-            raise ValueError("Tag read error")
+        self._check_for_error(data[0])
         return data[1:]
 
     async def write_tag(self, tag: Tag, sector: int, data: bytes, offset: int = 0):
@@ -193,12 +278,14 @@ class InfinityBase(object):
         if len(data) != 16:
             raise ValueError("Must supply exactly 16 bytes")
         data = await self.comms.send_message(0xa3, [tag.index, sector, offset] + list(data))
-        if data[0] == ErrorType.TAG_IO_ERROR.value:
-            raise ValueError("Tag write error")
+        self._check_for_error(data[0])
 
-
-async def main():
-    base = InfinityBase()
+async def run_base(serial: str):
+    base = InfinityBase(serial)
+    off = Color(0, 0, 0)
+    red = Color(200, 0, 0)
+    green = Color(0, 56, 0)
+    blue = Color(0, 0, 200)
 
     async def on_change(event: TagChangeEvent):
         if not event.is_removed:
@@ -209,15 +296,15 @@ async def main():
                 print(f"Failed to read tag data: {e}")
 
         tags = await base.get_all_tags()
-        color = (0, 0, 0)
+        color = off
         count = len(tags.get(event.tag.platform, []))
         if count == 1:
-            color = (0, 0, 200)
+            color = blue
         elif count == 2:
-            color = (0, 56, 0)
+            color = green
         elif count > 2:
-            color = (200, 0, 0)
-        await base.set_color(event.tag.platform, *color)
+            color = red
+        await base.set_color(event.tag.platform, color)
 
     base.on_tags_changed = on_change
 
@@ -225,18 +312,29 @@ async def main():
 
     print(f"Tags: {await base.get_all_tags()}")
 
-    await base.set_color(1, 200, 0, 0)
+    await base.set_color(1, red)
 
-    await base.set_color(2, 0, 56, 0)
+    await base.set_color(2, green)
 
-    await base.fade_color(3, 0, 0, 200)
+    await base.fade_color(3, blue)
 
     await asyncio.sleep(3)
 
-    await base.flash_color(3, 0, 0, 200)
+    await base.fade_random(2, 0x10, 0x11)
+    await base.flash_color(3, blue, 0x8, 0x8, 9)
 
+    await base.comms_task # sleep forever
+
+async def main():
+    tasks = []
+    for dev in hid.enumerate(DEVICE_VID, DEVICE_PID):
+        tasks.append(asyncio.create_task(run_base(dev["serial_number"])))
+    if len(tasks) == 0:
+        print("No bases detected!")
+        return
+    await asyncio.sleep(3)
     print("Try adding and removing figures and discs to/from the base. Ctrl-C to quit")
-    await base.comms_task
+    await asyncio.gather(*tasks)
 
 if __name__ == '__main__':
     try:
